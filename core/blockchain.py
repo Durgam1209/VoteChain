@@ -1,7 +1,8 @@
 import json
 from web3 import Web3
 from web3.logs import DISCARD
-from config import ROOT, RPC_URL, CONTRACT_ADDRESS, CHAIN_ID
+from eth_account import Account
+from config import ROOT, RPC_URL, CONTRACT_ADDRESS, CHAIN_ID, TRANSACTION_PRIVATE_KEY
 
 ARTIFACT = ROOT / "blockchain" / "artifacts" / "contracts" / "Voting.sol" / "Voting.json"
 DEPLOYMENT = ROOT / "blockchain" / "deployment.json"
@@ -15,83 +16,81 @@ class TransactionSubmittedError(RuntimeError):
 
 
 def load_contract():
-    """Load the deployed VoteChain contract and fail closed if it is absent."""
     if not ARTIFACT.exists():
-        raise RuntimeError("Contract artifact not found. Run the Hardhat compile command first.")
+        raise RuntimeError("Contract artifact not found. Ensure blockchain/artifacts/contracts/Voting.sol/Voting.json is committed.")
 
-    if CONTRACT_ADDRESS:
-        address = CONTRACT_ADDRESS
-    elif DEPLOYMENT.exists():
-        deployment = json.loads(DEPLOYMENT.read_text(encoding="utf-8"))
-        address = str(deployment.get("address", "")).strip()
-    else:
-        address = ""
-
+    address = CONTRACT_ADDRESS
+    if not address and DEPLOYMENT.exists():
+        address = str(json.loads(DEPLOYMENT.read_text(encoding="utf-8")).get("address", "")).strip()
     if not address:
-        raise RuntimeError(
-            "VoteChain contract address is missing. Deploy the contract and check blockchain/deployment.json."
-        )
+        raise RuntimeError("Contract address missing. Set CONTRACT_ADDRESS in Streamlit Secrets.")
 
     artifact = json.loads(ARTIFACT.read_text(encoding="utf-8"))
-    w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 12}))
+    w3 = Web3(Web3.HTTPProvider(RPC_URL, request_kwargs={"timeout": 20}))
     if not w3.is_connected():
-        raise RuntimeError(f"Cannot connect to local blockchain at {RPC_URL}.")
+        raise RuntimeError("Cannot connect to the configured blockchain RPC. Check RPC_URL in Streamlit Secrets.")
+    actual_chain_id = int(w3.eth.chain_id)
+    if actual_chain_id != int(CHAIN_ID):
+        raise RuntimeError(f"Wrong blockchain network: connected chain ID {actual_chain_id}, expected {CHAIN_ID}.")
 
-    if int(w3.eth.chain_id) != int(CHAIN_ID):
-        raise RuntimeError(
-            f"Wrong blockchain network: connected chain ID {w3.eth.chain_id}, expected {CHAIN_ID}."
-        )
-
-    try:
-        checksum_address = Web3.to_checksum_address(address)
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid VoteChain contract address: {address}") from exc
-
-    bytecode = w3.eth.get_code(checksum_address)
-    if not bytecode:
-        raise RuntimeError(
-            f"No smart contract is deployed at {checksum_address} on chain {w3.eth.chain_id}. "
-            "The Hardhat node may have been restarted. Deploy Voting.sol to the currently running node."
-        )
-
+    checksum_address = Web3.to_checksum_address(address)
+    if not w3.eth.get_code(checksum_address):
+        raise RuntimeError(f"No contract code found at {checksum_address} on chain {actual_chain_id}. Verify CONTRACT_ADDRESS and network.")
     contract = w3.eth.contract(address=checksum_address, abi=artifact["abi"])
     return w3, contract
 
 
+def _send_signed_transaction(w3, function_call):
+    if not TRANSACTION_PRIVATE_KEY:
+        raise RuntimeError("TRANSACTION_PRIVATE_KEY is missing. Add it to Streamlit Secrets; never commit it to GitHub.")
+    account = Account.from_key(TRANSACTION_PRIVATE_KEY)
+    if int(w3.eth.chain_id) != int(CHAIN_ID):
+        raise RuntimeError("RPC chain ID changed; refusing to sign transaction.")
+    nonce = w3.eth.get_transaction_count(account.address, "pending")
+    tx = function_call.build_transaction({
+        "from": account.address,
+        "nonce": nonce,
+        "chainId": int(CHAIN_ID),
+        "gas": 500000,
+        "gasPrice": w3.eth.gas_price,
+    })
+    signed = account.sign_transaction(tx)
+    raw_tx = getattr(signed, "raw_transaction", None) or signed.rawTransaction
+    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+    return tx_hash
+
+
 def initialize_election(election_id: str):
     w3, contract = load_contract()
-    account = w3.eth.accounts[0]
     key = Web3.keccak(text=election_id)
-    tx = contract.functions.initializeElection(key).transact({"from": account})
-    receipt = w3.eth.wait_for_transaction_receipt(tx, timeout=30)
+    tx_hash = _send_signed_transaction(w3, contract.functions.initializeElection(key))
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     if receipt.status != 1:
-        raise RuntimeError("Election initialization transaction failed.")
+        raise RuntimeError(f"Election initialization transaction failed: {tx_hash.hex()}")
     return receipt.transactionHash.hex()
 
 
 def record_ballot(election_id: str, commitment: str, nullifier: str, on_submitted=None):
-    """Submit a ballot and expose its hash before waiting for confirmation.
-
-    The callback lets the local recovery queue persist the transaction hash even
-    if waiting for a receipt subsequently times out.
-    """
     w3, contract = load_contract()
-    account = w3.eth.accounts[0]
-    tx_hash = contract.functions.recordBallot(
-        Web3.keccak(text=election_id),
-        bytes.fromhex(commitment),
-        bytes.fromhex(nullifier)
-    ).transact({"from": account})
+    if len(commitment) != 64 or len(nullifier) != 64:
+        raise ValueError("Commitment and nullifier must each be 64-character hexadecimal strings.")
+    try:
+        commitment_bytes = bytes.fromhex(commitment)
+        nullifier_bytes = bytes.fromhex(nullifier)
+    except ValueError as exc:
+        raise ValueError("Commitment and nullifier must contain hexadecimal characters only.") from exc
+
+    tx_hash = _send_signed_transaction(
+        w3,
+        contract.functions.recordBallot(Web3.keccak(text=election_id), commitment_bytes, nullifier_bytes),
+    )
     tx_hex = tx_hash.hex()
     if on_submitted:
         try:
             on_submitted(tx_hex)
         except Exception as exc:
-            raise TransactionSubmittedError(
-                tx_hex,
-                f"Transaction {tx_hex} was broadcast, but the local recovery record could not save its hash: {exc}"
-            ) from exc
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+            raise TransactionSubmittedError(tx_hex, f"Transaction {tx_hex} was broadcast, but its recovery record could not save the hash: {exc}") from exc
+    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=120)
     if receipt.status != 1:
         raise RuntimeError(f"Blockchain transaction failed: {tx_hex}")
     return tx_hex
@@ -103,7 +102,6 @@ def chain_ballot_count(election_id: str):
 
 
 def transaction_details(tx_hash: str):
-    """Return public transaction metadata for a confirmed demo transaction."""
     w3, contract = load_contract()
     tx = w3.eth.get_transaction(tx_hash)
     receipt = w3.eth.get_transaction_receipt(tx_hash)
@@ -118,7 +116,6 @@ def transaction_details(tx_hash: str):
 
 
 def verify_ballot_receipt(election_id: str, tx_hash: str, commitment: str):
-    """Verify that a confirmed tx emitted this election's BallotRecorded event."""
     if len(commitment) != 64:
         raise ValueError("Commitment must be a 64-character SHA-256 hex string.")
     try:
@@ -126,7 +123,10 @@ def verify_ballot_receipt(election_id: str, tx_hash: str, commitment: str):
     except ValueError as exc:
         raise ValueError("Commitment must contain hexadecimal characters only.") from exc
     w3, contract = load_contract()
-    receipt = w3.eth.get_transaction_receipt(tx_hash.strip())
+    try:
+        receipt = w3.eth.get_transaction_receipt(tx_hash.strip())
+    except Exception:
+        return {"verified": False, "reason": "Transaction is not confirmed or cannot be found."}
     if receipt is None or receipt.status != 1:
         return {"verified": False, "reason": "Transaction is not confirmed."}
     tx = w3.eth.get_transaction(tx_hash.strip())
@@ -137,17 +137,11 @@ def verify_ballot_receipt(election_id: str, tx_hash: str, commitment: str):
     for event in events:
         args = event["args"]
         if bytes(args["electionKey"]) == bytes(expected_election) and bytes(args["commitment"]) == expected_commitment:
-            return {
-                "verified": True,
-                "block_number": receipt.blockNumber,
-                "transaction_hash": receipt.transactionHash.hex(),
-                "status": "CONFIRMED",
-            }
+            return {"verified": True, "block_number": receipt.blockNumber, "transaction_hash": receipt.transactionHash.hex(), "status": "CONFIRMED"}
     return {"verified": False, "reason": "No matching ballot commitment event was found in this transaction."}
 
 
 def transaction_receipt_status(tx_hash: str):
-    """Return receipt status; None means the transaction is not yet available."""
     w3, _ = load_contract()
     try:
         receipt = w3.eth.get_transaction_receipt(tx_hash)
