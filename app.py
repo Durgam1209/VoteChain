@@ -178,6 +178,16 @@ def render_public_verification():
 try:
     init_db()
     init_candidate_profiles()
+    # Ensure demo admin exists on first deployment
+    try:
+        create_user(
+            "admin",
+            "Demo Administrator",
+            "VoteChain-Admin-2026",
+            True
+        )
+    except ValueError:
+        pass  # Admin already exists; preserve existing account
 except Exception as exc:
     st.error(f"VoteChain could not initialize its local database: {exc}")
     st.stop()
