@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.env
+.streamlit/secrets.toml
+data/
+blockchain/node_modules/
+blockchain/artifacts/
+blockchain/cache/
+blockchain/deployment.json
+*.sqlite3
+*.db
+*.log
+*_audit.csv
